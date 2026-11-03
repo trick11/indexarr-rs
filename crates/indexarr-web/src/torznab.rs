@@ -143,7 +143,7 @@ async fn torznab_api(
         return error_response(202, &format!("No such function: {}", params.t));
     }
 
-    match do_search(&state, &params).await {
+    match do_search(&state.pool, &params).await {
         Ok(xml) => xml_response(&xml),
         Err(e) => {
             tracing::error!(error = %e, "torznab search failed");
@@ -152,17 +152,18 @@ async fn torznab_api(
     }
 }
 
-async fn do_search(state: &AppState, params: &TorznabParams) -> Result<String, sqlx::Error> {
-    let pool = &state.pool;
-
+async fn do_search(pool: &sqlx::PgPool, params: &TorznabParams) -> Result<String, sqlx::Error> {
     let mut conditions = vec![
         "t.resolved_at IS NOT NULL".to_string(),
         "t.announced_at IS NOT NULL".to_string(),
         "t.seed_count >= 1".to_string(),
     ];
 
-    let mut bind_strings: Vec<String> = Vec::new();
-    let mut bind_ints: Vec<i32> = Vec::new();
+    enum SearchBind {
+        Text(String),
+        Integer(i32),
+    }
+    let mut bindings = Vec::new();
     let mut param_idx = 0usize;
 
     // Text search
@@ -172,7 +173,7 @@ async fn do_search(state: &AppState, params: &TorznabParams) -> Result<String, s
             "t.search_vector @@ plainto_tsquery('english', ${})",
             param_idx
         ));
-        bind_strings.push(params.q.clone());
+        bindings.push(SearchBind::Text(params.q.clone()));
     }
 
     // Season/Episode
@@ -181,14 +182,14 @@ async fn do_search(state: &AppState, params: &TorznabParams) -> Result<String, s
     {
         param_idx += 1;
         conditions.push(format!("c.season = ${}", param_idx));
-        bind_ints.push(s);
+        bindings.push(SearchBind::Integer(s));
     }
     if !params.ep.is_empty()
         && let Ok(e) = params.ep.parse::<i32>()
     {
         param_idx += 1;
         conditions.push(format!("c.episode = ${}", param_idx));
-        bind_ints.push(e);
+        bindings.push(SearchBind::Integer(e));
     }
 
     // IMDB
@@ -200,7 +201,7 @@ async fn do_search(state: &AppState, params: &TorznabParams) -> Result<String, s
             format!("tt{}", params.imdbid)
         };
         conditions.push(format!("c.imdb_id = ${}", param_idx));
-        bind_strings.push(imdb);
+        bindings.push(SearchBind::Text(imdb));
     }
 
     // TMDB
@@ -209,7 +210,7 @@ async fn do_search(state: &AppState, params: &TorznabParams) -> Result<String, s
     {
         param_idx += 1;
         conditions.push(format!("c.tmdb_id = ${}", param_idx));
-        bind_ints.push(id);
+        bindings.push(SearchBind::Integer(id));
     }
 
     // Function-specific type filters
@@ -240,13 +241,13 @@ async fn do_search(state: &AppState, params: &TorznabParams) -> Result<String, s
     // continue to use bind parameters, and limit/offset are clamped integers.
     let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
 
-    // Bind in order: strings first, then ints (matching how we built the params)
-    // This is a simplified approach — for production we'd use a proper query builder
-    for s in &bind_strings {
-        query = query.bind(s);
-    }
-    for i in &bind_ints {
-        query = query.bind(i);
+    // PostgreSQL binds are positional: preserve the condition order even when
+    // text and numeric filters are interleaved (season, episode, then IMDb).
+    for binding in &bindings {
+        query = match binding {
+            SearchBind::Text(value) => query.bind(value),
+            SearchBind::Integer(value) => query.bind(value),
+        };
     }
 
     let rows = query.fetch_all(pool).await?;
@@ -406,6 +407,56 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::log_capture::LogCapture;
+
+    #[tokio::test]
+    #[ignore = "requires INDEXARR_TEST_DB_URL pointing at a disposable database"]
+    async fn torznab_filters_keep_parameter_order() {
+        let mut settings = Settings::from_env();
+        settings.db_url = std::env::var("INDEXARR_TEST_DB_URL").expect("test database URL");
+        let pool = indexarr_core::db::init_db(&settings).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO torrents (info_hash, name, size, seed_count, resolved_at, announced_at) VALUES \
+             (repeat('a',40), 'Example Show S23E01 1080p', 1000, 2, NOW(), NOW()), \
+             (repeat('b',40), 'Example Show S23E03 1080p', 1000, 2, NOW(), NOW()), \
+             (repeat('c',40), 'Other Show S23E01 1080p', 1000, 2, NOW(), NOW()), \
+             (repeat('d',40), 'Example Movie 2024 1080p', 1000, 2, NOW(), NOW()); \
+             INSERT INTO torrent_content (info_hash, content_type, season, episode, imdb_id, tmdb_id) VALUES \
+             (repeat('a',40), 'tv_show', 23, 1, 'tt0413573', 100), \
+             (repeat('b',40), 'tv_show', 23, 3, 'tt0413573', 100), \
+             (repeat('c',40), 'tv_show', 23, 1, 'tt0000001', 200), \
+             (repeat('d',40), 'movie', NULL, NULL, 'tt0000002', 300);"
+        ).execute(&pool).await.unwrap();
+        for (query, expected) in [
+            (
+                r#"{"t":"tvsearch","season":"23","ep":"1","imdbid":"0413573"}"#,
+                vec!['a'],
+            ),
+            (
+                r#"{"t":"tvsearch","season":"23","ep":"3","imdbid":"tt0413573"}"#,
+                vec!['b'],
+            ),
+            (
+                r#"{"t":"tvsearch","season":"23","imdbid":"tt0413573"}"#,
+                vec!['a', 'b'],
+            ),
+            (
+                r#"{"t":"tvsearch","q":"Example","season":"23","ep":"1","imdbid":"tt0413573","tmdbid":"100"}"#,
+                vec!['a'],
+            ),
+            (
+                r#"{"t":"movie","imdbid":"tt0000002","tmdbid":"300"}"#,
+                vec!['d'],
+            ),
+        ] {
+            let params: TorznabParams = serde_json::from_str(query).unwrap();
+            let xml = do_search(&pool, &params).await.unwrap();
+            assert_eq!(xml.matches("<item>").count(), expected.len(), "{query}");
+            for hash_char in expected {
+                let hash: String = std::iter::repeat_n(hash_char, 40).collect();
+                assert!(xml.contains(&format!("<guid>{hash}</guid>")), "{query}");
+            }
+        }
+    }
 
     fn test_state() -> Arc<AppState> {
         let pool = PgPoolOptions::new()

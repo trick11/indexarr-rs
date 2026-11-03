@@ -37,6 +37,7 @@ jobs:
           cargo fmt --all -- --check
           cargo test --workspace --locked
           cargo test -p indexarr-dht local_category_filter_persists_only_allowed_metadata -- --ignored
+          cargo test -p indexarr-web torznab_filters_keep_parameter_order -- --ignored
           cargo clippy --workspace --all-targets --locked -- -D warnings
 
   publish:
