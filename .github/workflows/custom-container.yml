@@ -14,7 +14,33 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  validate:
+    if: github.repository == 'trick11/indexarr-rs'
+    runs-on: ubuntu-latest
+    container: rust:1.97-bookworm
+    env:
+      RUSTUP_TOOLCHAIN: 1.97.1
+      INDEXARR_TEST_DB_URL: postgres://indexarr:indexarr-test-only@postgres/indexarr_test
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: indexarr
+          POSTGRES_PASSWORD: indexarr-test-only
+          POSTGRES_DB: indexarr_test
+        options: --health-cmd "pg_isready -U indexarr" --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate custom build and category filtering
+        run: |
+          rustup component add rustfmt clippy
+          cargo fmt --all -- --check
+          cargo test --workspace --locked
+          cargo test -p indexarr-dht local_category_filter_persists_only_allowed_metadata -- --ignored
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+
   publish:
+    needs: validate
     if: github.repository == 'trick11/indexarr-rs'
     runs-on: ubuntu-latest
     steps:
