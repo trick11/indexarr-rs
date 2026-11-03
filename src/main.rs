@@ -391,6 +391,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         state.settings.resolve_workers as usize,
                         state.settings.resolve_timeout as u64,
                         state.settings.save_files_threshold,
+                        state.settings.local_import_categories.clone(),
                         cancel.clone(),
                         resolver_peer_id,
                         tracker_discovery,

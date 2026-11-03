@@ -14,6 +14,16 @@ pub async fn init_db(settings: &Settings) -> Result<PgPool, sqlx::Error> {
 
     run_migrations(&pool).await?;
 
+    // Forget rejections made obsolete by a changed local allowlist. The crawler
+    // can discover these hashes again without retaining their full metadata.
+    sqlx::query(
+        "DELETE FROM local_category_rejections \
+         WHERE cardinality($1::text[]) = 0 OR content_type = ANY($1)",
+    )
+    .bind(&settings.local_import_categories)
+    .execute(&pool)
+    .await?;
+
     Ok(pool)
 }
 
@@ -98,6 +108,12 @@ async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
 }
 
 const SCHEMA_SQL: &str = r#"
+-- Local-only rejection cache: never searched, announced, or exported to peers.
+CREATE TABLE IF NOT EXISTS local_category_rejections (
+    info_hash VARCHAR(40) PRIMARY KEY,
+    content_type TEXT NOT NULL
+);
+
 -- Torrents
 CREATE TABLE IF NOT EXISTS torrents (
     info_hash       VARCHAR(40) PRIMARY KEY,
@@ -159,6 +175,7 @@ CREATE TABLE IF NOT EXISTS resolver_attempt_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_resolver_events_created ON resolver_attempt_events (created_at);
+CREATE INDEX IF NOT EXISTS idx_resolver_events_info_hash ON resolver_attempt_events (info_hash);
 CREATE INDEX IF NOT EXISTS idx_resolver_events_source_created ON resolver_attempt_events (source, created_at);
 
 -- Torrent files

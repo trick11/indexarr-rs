@@ -25,6 +25,7 @@ pub struct MetadataResolver {
     workers: usize,
     timeout_secs: u64,
     save_files_threshold: u32,
+    local_import_categories: Vec<String>,
     cancel: CancellationToken,
     /// Stable peer_id shared with `TrackerDiscovery` so trackers and peers see
     /// the same identity from this resolver instance.
@@ -54,6 +55,7 @@ impl MetadataResolver {
         workers: usize,
         timeout_secs: u64,
         save_files_threshold: u32,
+        local_import_categories: Vec<String>,
         cancel: CancellationToken,
         peer_id: Id20,
         tracker_discovery: SharedTrackerDiscovery,
@@ -65,6 +67,7 @@ impl MetadataResolver {
             workers,
             timeout_secs,
             save_files_threshold,
+            local_import_categories,
             cancel,
             peer_id,
             tracker_discovery,
@@ -154,6 +157,7 @@ impl MetadataResolver {
                 let pool = self.pool.clone();
                 let timeout = self.timeout_secs;
                 let threshold = self.save_files_threshold;
+                let local_categories = self.local_import_categories.clone();
                 let cancel = self.cancel.clone();
                 let peer_id = self.peer_id;
                 let tracker_discovery = self.tracker_discovery.clone();
@@ -215,9 +219,14 @@ impl MetadataResolver {
                                 lt_tex = harvested_trackers.len(),
                                 "BEP 9 fetch ok"
                             );
-                            if let Err(error) =
-                                process_resolved(&pool, &hash, &meta, threshold).await
-                            {
+                            let outcome =
+                                process_resolved(&pool, &hash, &meta, threshold, &local_categories)
+                                    .await;
+                            if matches!(outcome, Ok(ProcessOutcome::Rejected)) {
+                                shared.peer_cache.remove(&hash);
+                                return;
+                            }
+                            if let Err(error) = outcome {
                                 let retry_at = schedule_retry(&pool, &job).await;
                                 record_attempt(
                                     &pool,
@@ -623,12 +632,19 @@ fn parse_info_dict(bytes: &[u8]) -> Result<ResolvedMeta, String> {
 }
 
 /// Process resolved metadata — store in DB and run content pipeline.
+#[derive(Debug, PartialEq, Eq)]
+enum ProcessOutcome {
+    Stored,
+    Rejected,
+}
+
 async fn process_resolved(
     pool: &PgPool,
     info_hash: &str,
     meta: &ResolvedMeta,
     save_files_threshold: u32,
-) -> Result<(), sqlx::Error> {
+    local_categories: &[String],
+) -> Result<ProcessOutcome, sqlx::Error> {
     // Parse and classify
     let parsed = indexarr_parser::parse(&meta.name);
     let file_infos: Vec<indexarr_classifier::FileInfo> = meta
@@ -644,6 +660,32 @@ async fn process_resolved(
     let classification = indexarr_classifier::classify(&parsed, &file_infos, &meta.name);
     let quality_score = indexarr_classifier::compute_quality_score(&parsed);
     let mut tx = pool.begin().await?;
+
+    if !local_categories.is_empty() && !local_categories.contains(&classification.content_type) {
+        // Serialize against hash ingestion so an observation already in flight
+        // cannot resurrect the row after its metadata has been discarded.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(info_hash)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "INSERT INTO local_category_rejections (info_hash, content_type) \
+             VALUES ($1, $2) ON CONFLICT (info_hash) DO UPDATE \
+             SET content_type = EXCLUDED.content_type",
+        )
+        .bind(info_hash)
+        .bind(&classification.content_type)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM torrents WHERE info_hash = $1")
+            .bind(info_hash)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        tracing::info!(hash = %info_hash, content_type = %classification.content_type,
+            "discarded local metadata outside category allowlist");
+        return Ok(ProcessOutcome::Rejected);
+    }
 
     // Update torrent record
     sqlx::query(
@@ -749,7 +791,7 @@ async fn process_resolved(
         "resolved torrent"
     );
 
-    Ok(())
+    Ok(ProcessOutcome::Stored)
 }
 
 fn file_extension(path: &str) -> Option<String> {
@@ -760,7 +802,173 @@ fn file_extension(path: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{fair_lane_limits, file_extension, retry_delay_secs};
+    use super::{
+        FileEntry, ProcessOutcome, ResolvedMeta, fair_lane_limits, file_extension,
+        process_resolved, retry_delay_secs,
+    };
+
+    /// Run against an isolated PostgreSQL database, never a production database.
+    #[tokio::test]
+    #[ignore = "requires INDEXARR_TEST_DB_URL pointing at a disposable database"]
+    async fn local_category_filter_persists_only_allowed_metadata() {
+        let mut settings = indexarr_core::config::Settings::from_env();
+        settings.db_url = std::env::var("INDEXARR_TEST_DB_URL").expect("test database URL");
+        settings.local_import_categories = vec!["movie".into(), "tv_show".into()];
+        let pool = indexarr_core::db::init_db(&settings).await.unwrap();
+        for (n, name, path, expected) in [
+            (
+                1,
+                "Example.Movie.2024.1080p.BluRay.x264",
+                "movie.mkv",
+                "movie",
+            ),
+            (
+                2,
+                "Example.Show.S01E01.1080p.WEB-DL",
+                "episode.mkv",
+                "tv_show",
+            ),
+            (3, "Example.Album.FLAC", "track.flac", "music"),
+            (4, "Example.XXX.1080p", "video.mp4", "xxx"),
+            (5, "Unclassified", "README", "unknown"),
+        ] {
+            let hash = format!("{n:040x}");
+            let observation = crate::DiscoveredHash {
+                info_hash: hash.clone(),
+                source: "bep51".into(),
+                peer_ip: None,
+                peer_port: None,
+            };
+            assert_eq!(
+                crate::ingest::upsert_hash(&pool, &observation)
+                    .await
+                    .unwrap(),
+                Some(true)
+            );
+            let meta = ResolvedMeta {
+                name: name.into(),
+                size: 1000,
+                files: vec![FileEntry {
+                    path: path.into(),
+                    size: 1000,
+                }],
+                is_private: false,
+                piece_length: None,
+                piece_count: None,
+                seed_count: 3,
+                peer_count: 4,
+            };
+            let outcome =
+                process_resolved(&pool, &hash, &meta, 200, &settings.local_import_categories)
+                    .await
+                    .unwrap();
+            let allowed = expected == "movie" || expected == "tv_show";
+            assert_eq!(
+                outcome,
+                if allowed {
+                    ProcessOutcome::Stored
+                } else {
+                    ProcessOutcome::Rejected
+                }
+            );
+            let stored: Option<String> =
+                sqlx::query_scalar("SELECT content_type FROM torrent_content WHERE info_hash=$1")
+                    .bind(&hash)
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap();
+            let rejected: Option<String> = sqlx::query_scalar(
+                "SELECT content_type FROM local_category_rejections WHERE info_hash=$1",
+            )
+            .bind(&hash)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                stored.as_deref(),
+                if allowed { Some(expected) } else { None }
+            );
+            assert_eq!(
+                rejected.as_deref(),
+                if allowed { None } else { Some(expected) }
+            );
+            if !allowed {
+                // Neither rediscovery nor a second simultaneous rejection can
+                // leave a torrent row eligible for repeated resolution.
+                let (rediscovered, repeated) = tokio::join!(
+                    crate::ingest::upsert_hash(&pool, &observation),
+                    process_resolved(&pool, &hash, &meta, 200, &settings.local_import_categories),
+                );
+                assert_eq!(rediscovered.unwrap(), None);
+                assert_eq!(repeated.unwrap(), ProcessOutcome::Rejected);
+                for query in [
+                    "SELECT count(*) FROM torrents WHERE info_hash=$1",
+                    "SELECT count(*) FROM torrent_content WHERE info_hash=$1",
+                    "SELECT count(*) FROM torrent_files WHERE info_hash=$1",
+                    "SELECT count(*) FROM torrent_tags WHERE info_hash=$1",
+                ] {
+                    let count: i64 = sqlx::query_scalar(query)
+                        .bind(&hash)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                    assert_eq!(count, 0, "rejected metadata leaked: {query}");
+                }
+            }
+        }
+        settings.local_import_categories.push("music".into());
+        let reopened = indexarr_core::db::init_db(&settings).await.unwrap();
+        let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM local_category_rejections")
+            .fetch_one(&reopened)
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining, 2,
+            "widening allowlist must release only matching rejections"
+        );
+        settings.local_import_categories.clear();
+        let unrestricted = indexarr_core::db::init_db(&settings).await.unwrap();
+        let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM local_category_rejections")
+            .fetch_one(&unrestricted)
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "disabling filter must release all rejected hashes"
+        );
+        let hash = format!("{:040x}", 4);
+        let observation = crate::DiscoveredHash {
+            info_hash: hash.clone(),
+            source: "bep51".into(),
+            peer_ip: None,
+            peer_port: None,
+        };
+        assert_eq!(
+            crate::ingest::upsert_hash(&pool, &observation)
+                .await
+                .unwrap(),
+            Some(true)
+        );
+        let meta = ResolvedMeta {
+            name: "Example.XXX.1080p".into(),
+            size: 1000,
+            files: vec![FileEntry {
+                path: "video.mp4".into(),
+                size: 1000,
+            }],
+            is_private: false,
+            piece_length: None,
+            piece_count: None,
+            seed_count: 0,
+            peer_count: 0,
+        };
+        assert_eq!(
+            process_resolved(&pool, &hash, &meta, 200, &[])
+                .await
+                .unwrap(),
+            ProcessOutcome::Stored
+        );
+    }
 
     #[test]
     fn fair_scheduler_reserves_live_and_upload_lanes() {

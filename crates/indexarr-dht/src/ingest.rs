@@ -88,13 +88,14 @@ async fn flush_batch(pool: &PgPool, hashes: &[DiscoveredHash]) -> (u64, u64) {
         }
 
         match upsert_hash(pool, hash).await {
-            Ok(is_new) => {
+            Ok(Some(is_new)) => {
                 if is_new {
                     inserted += 1;
                 } else {
                     updated += 1;
                 }
             }
+            Ok(None) => {}
             Err(e) => {
                 tracing::debug!(error = %e, hash = %hash.info_hash, "failed to upsert hash");
             }
@@ -105,11 +106,20 @@ async fn flush_batch(pool: &PgPool, hashes: &[DiscoveredHash]) -> (u64, u64) {
 }
 
 /// Insert or update a discovered hash. Returns true if new.
-async fn upsert_hash(pool: &PgPool, hash: &DiscoveredHash) -> Result<bool, sqlx::Error> {
+pub(crate) async fn upsert_hash(
+    pool: &PgPool,
+    hash: &DiscoveredHash,
+) -> Result<Option<bool>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(&hash.info_hash)
+        .execute(&mut *tx)
+        .await?;
     // Try insert first
     let result = sqlx::query(
         "INSERT INTO torrents (info_hash, source, discovered_at, observations) \
-         VALUES ($1, $2, NOW(), 1) \
+         SELECT $1, $2, NOW(), 1 WHERE NOT EXISTS \
+           (SELECT 1 FROM local_category_rejections WHERE info_hash = $1) \
          ON CONFLICT (info_hash) DO UPDATE SET \
            observations = torrents.observations + 1, \
            source = CASE \
@@ -120,9 +130,10 @@ async fn upsert_hash(pool: &PgPool, hash: &DiscoveredHash) -> Result<bool, sqlx:
     )
     .bind(&hash.info_hash)
     .bind(&hash.source)
-    .fetch_one(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     use sqlx::Row;
-    Ok(result.get::<bool, _>("is_new"))
+    Ok(result.map(|row| row.get::<bool, _>("is_new")))
 }

@@ -36,6 +36,7 @@ async fn system_status(
         "host": state.settings.host,
         "port": state.settings.port,
         "workers": state.settings.workers,
+        "local_import_categories": state.settings.local_import_categories,
         "debug": state.settings.debug,
         "total_hashes": total,
         "resolved_hashes": resolved,

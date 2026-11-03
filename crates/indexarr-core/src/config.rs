@@ -45,6 +45,8 @@ pub struct Settings {
     pub resolve_workers: u32,
     pub resolve_timeout: f64,
     pub save_files_threshold: u32,
+    /// Categories retained after local metadata resolution. Empty keeps all.
+    pub local_import_categories: Vec<String>,
 
     // Announcer
     pub announcer_enabled: bool,
@@ -154,6 +156,7 @@ impl Settings {
             resolve_workers: env_u32("INDEXARR_RESOLVE_WORKERS", 20),
             resolve_timeout: env_f64("INDEXARR_RESOLVE_TIMEOUT", 15.0),
             save_files_threshold: env_u32("INDEXARR_SAVE_FILES_THRESHOLD", 200),
+            local_import_categories: env_csv("INDEXARR_LOCAL_IMPORT_CATEGORIES"),
 
             announcer_enabled: env_bool("INDEXARR_ANNOUNCER_ENABLED", true),
             announcer_pool_size: env_u32("INDEXARR_ANNOUNCER_POOL_SIZE", 1000),
